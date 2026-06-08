@@ -1,0 +1,24 @@
+# ── ModelMesh Training Requirements ──────────────────────────────────────────
+
+# ML
+mlflow==2.9.2
+scikit-learn==1.4.0
+xgboost==2.0.3
+numpy==1.26.3
+pandas==2.1.4
+optuna==3.5.0
+shap==0.44.0
+
+# Database
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+
+# Orchestration
+prefect==2.14.18
+prefect-sqlalchemy==0.4.1
+
+# Config
+pydantic==2.5.3
+pydantic-settings==2.1.0
+structlog==24.1.0
+httpx==0.26.0

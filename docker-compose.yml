@@ -1,0 +1,285 @@
+version: "3.9"
+
+# ── ModelMesh — Full Stack Docker Compose ─────────────────────────────────────
+# Services:
+#   - modelmesh-api    : FastAPI inference server
+#   - mlflow           : Experiment tracking + model registry UI
+#   - prefect-server   : Workflow orchestration UI
+#   - prefect-worker   : Executes Prefect flows
+#   - drift-monitor    : Periodic Evidently drift checks
+#   - kafka            : Prediction streaming
+#   - zookeeper        : Kafka dependency
+#   - postgres         : Prediction logs + metadata
+#   - prometheus       : Metrics scraping
+#   - grafana          : Dashboards
+#
+# Start everything:  docker compose up -d
+# API docs:          http://localhost:8000/docs
+# MLflow UI:         http://localhost:5000
+# Prefect UI:        http://localhost:4200
+# Grafana:           http://localhost:3000  (admin/admin)
+# Prometheus:        http://localhost:9090
+
+x-common-env: &common-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: modelmesh
+  POSTGRES_PASSWORD: modelmesh_secret
+  POSTGRES_DB: modelmesh_db
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MLFLOW_REGISTRY_URI: http://mlflow:5000
+  PREFECT_API_URL: http://prefect-server:4200/api
+  ENVIRONMENT: development
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: modelmesh-postgres
+    environment:
+      POSTGRES_USER: modelmesh
+      POSTGRES_PASSWORD: modelmesh_secret
+      POSTGRES_DB: modelmesh_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modelmesh -d modelmesh_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: modelmesh-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: modelmesh-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"      # external (host)
+      - "29092:29092"    # internal (container-to-container)
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 48
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: modelmesh-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+          --topic modelmesh.predictions --partitions 3 --replication-factor 1 &&
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+          --topic modelmesh.drift_alerts --partitions 1 --replication-factor 1 &&
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+          --topic modelmesh.retrain_triggers --partitions 1 --replication-factor 1 &&
+        echo 'Topics created successfully'
+      "
+    restart: "no"
+
+  # ── MLflow ──────────────────────────────────────────────────────────────────
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: modelmesh-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://modelmesh:modelmesh_secret@postgres:5432/modelmesh_db
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlruns
+    volumes:
+      - mlflow_artifacts:/mlruns
+    command: >
+      mlflow server
+        --backend-store-uri postgresql://modelmesh:modelmesh_secret@postgres:5432/modelmesh_db
+        --default-artifact-root /mlruns
+        --host 0.0.0.0
+        --port 5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Prefect ─────────────────────────────────────────────────────────────────
+
+  prefect-server:
+    image: prefecthq/prefect:2-python3.11
+    container_name: modelmesh-prefect-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_SERVER_DATABASE_CONNECTION_URL: >-
+        postgresql+asyncpg://modelmesh:modelmesh_secret@postgres:5432/modelmesh_db
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+    command: prefect server start --host 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  prefect-worker:
+    build:
+      context: .
+      dockerfile: docker/training/Dockerfile
+    container_name: modelmesh-prefect-worker
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      PREFECT_API_URL: http://prefect-server:4200/api
+    command: prefect worker start --pool "default-agent-pool" --type process
+    volumes:
+      - mlflow_artifacts:/app/mlruns
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  modelmesh-api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: modelmesh-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+      - "8001:8001"    # Prometheus metrics port
+    environment:
+      <<: *common-env
+      API_KEYS: "dev-key-1234,test-key-5678"
+      ENABLE_SHADOW_DEPLOYMENT: "true"
+      ENABLE_KAFKA_STREAMING: "true"
+      SHADOW_TRAFFIC_PCT: "0.05"
+      ENABLE_SHAP: "true"
+      SHAP_SAMPLE_RATE: "0.1"
+      DEBUG: "false"
+    volumes:
+      - mlflow_artifacts:/app/mlruns:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  drift-monitor:
+    build:
+      context: .
+      dockerfile: docker/drift/Dockerfile
+    container_name: modelmesh-drift-monitor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      DRIFT_CHECK_INTERVAL_MINUTES: "60"
+      PSI_THRESHOLD: "0.2"
+    volumes:
+      - ./data/reference:/app/data/reference:ro
+    restart: unless-stopped
+
+  # ── Observability ────────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: modelmesh-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: modelmesh-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  mlflow_artifacts:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: modelmesh-network

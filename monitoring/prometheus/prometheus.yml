@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: "modelmesh-prometheus"
+
+# ── Alert Rules ────────────────────────────────────────────────────────────────
+rule_files:
+  - "alert_rules.yml"
+
+# ── Alertmanager ──────────────────────────────────────────────────────────────
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# ── Scrape Configs ─────────────────────────────────────────────────────────────
+scrape_configs:
+  # ModelMesh API — inference metrics
+  - job_name: "modelmesh-api"
+    static_configs:
+      - targets: ["modelmesh-api:8000"]
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # PostgreSQL exporter
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # Kafka exporter
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # Node exporter (host metrics)
+  - job_name: "node"
+    static_configs:
+      - targets: ["node-exporter:9100"]

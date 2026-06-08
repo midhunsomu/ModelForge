@@ -1,0 +1,288 @@
+# ── ModelMesh API — Kubernetes Deployment ─────────────────────────────────────
+# Designed for K3s (local) and EKS/GKE (cloud).
+# Resources are sized for a small cluster; increase for production.
+#
+# Deploy: kubectl apply -k k8s/overlays/dev/
+# Check:  kubectl get pods -n modelmesh
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: modelmesh
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+
+---
+# ── ConfigMap: non-sensitive config ──────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: modelmesh-config
+  namespace: modelmesh
+data:
+  ENVIRONMENT: "production"
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "INFO"
+  POSTGRES_HOST: "postgres-service"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "modelmesh_db"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka-service:9092"
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+  MLFLOW_REGISTRY_URI: "http://mlflow-service:5000"
+  PREFECT_API_URL: "http://prefect-service:4200/api"
+  SHADOW_TRAFFIC_PCT: "0.05"
+  ENABLE_SHADOW_DEPLOYMENT: "true"
+  ENABLE_KAFKA_STREAMING: "true"
+  ENABLE_SHAP: "true"
+  SHAP_SAMPLE_RATE: "0.1"
+  DRIFT_CHECK_INTERVAL_MINUTES: "60"
+  MAX_RETRAIN_PER_DAY: "3"
+
+---
+# ── Secret: sensitive credentials (in prod use Vault or Sealed Secrets) ───────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modelmesh-secrets
+  namespace: modelmesh
+type: Opaque
+stringData:
+  POSTGRES_USER: "modelmesh"
+  POSTGRES_PASSWORD: "modelmesh_secret"   # Override in prod with real secret
+  API_KEYS: "prod-key-abc123,internal-key-xyz789"
+
+---
+# ── Deployment: FastAPI inference API ────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelmesh-api
+  namespace: modelmesh
+  labels:
+    app: modelmesh-api
+    component: inference
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: modelmesh-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0      # zero-downtime rolling update
+  template:
+    metadata:
+      labels:
+        app: modelmesh-api
+        component: inference
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: modelmesh-api-sa
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: modelmesh-api:latest   # set via kustomize overlay
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: modelmesh-config
+            - secretRef:
+                name: modelmesh-secrets
+          # ── Resource limits ─────────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          # ── Health probes ────────────────────────────────────────────────────
+          # startupProbe: gives the model loader time to pull from MLflow
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 10
+            initialDelaySeconds: 10
+          # livenessProbe: if stuck, K8s restarts the pod
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          # readinessProbe: traffic routed only when model + DB are ready
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 5
+          # ── Graceful shutdown ────────────────────────────────────────────────
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]  # drain connections
+          volumeMounts:
+            - name: mlflow-artifacts
+              mountPath: /app/mlruns
+              readOnly: true
+      volumes:
+        - name: mlflow-artifacts
+          persistentVolumeClaim:
+            claimName: mlflow-pvc
+            readOnly: true
+      # ── Anti-affinity: spread pods across nodes ───────────────────────────
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["modelmesh-api"]
+                topologyKey: kubernetes.io/hostname
+
+---
+# ── Service: ClusterIP + optional LoadBalancer ───────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelmesh-api-service
+  namespace: modelmesh
+  labels:
+    app: modelmesh-api
+spec:
+  selector:
+    app: modelmesh-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
+
+---
+# ── HorizontalPodAutoscaler ───────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: modelmesh-api-hpa
+  namespace: modelmesh
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: modelmesh-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# ── ServiceAccount (least privilege) ────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelmesh-api-sa
+  namespace: modelmesh
+
+---
+# ── Drift Monitor CronJob ─────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: drift-monitor
+  namespace: modelmesh
+spec:
+  schedule: "0 * * * *"    # every hour
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: drift-monitor
+              image: modelmesh-drift:latest
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - configMapRef:
+                    name: modelmesh-config
+                - secretRef:
+                    name: modelmesh-secrets
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1000m"
+                  memory: "1Gi"
+              volumeMounts:
+                - name: reference-data
+                  mountPath: /app/data/reference
+                  readOnly: true
+          volumes:
+            - name: reference-data
+              configMap:
+                name: reference-data-config
+
+---
+# ── Ingress ───────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: modelmesh-ingress
+  namespace: modelmesh
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.modelmesh.local
+      secretName: modelmesh-tls
+  rules:
+    - host: api.modelmesh.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: modelmesh-api-service
+                port:
+                  number: 80

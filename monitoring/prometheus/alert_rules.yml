@@ -1,0 +1,56 @@
+groups:
+  - name: modelmesh_alerts
+    interval: 30s
+    rules:
+
+      # ── High Error Rate ──────────────────────────────────────────────────────
+      - alert: HighInferenceErrorRate
+        expr: |
+          rate(modelmesh_requests_total{status_code=~"5.."}[5m]) /
+          rate(modelmesh_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate on inference API"
+          description: "Error rate is {{ $value | humanizePercentage }} over last 5 minutes"
+
+      # ── High Latency P95 ────────────────────────────────────────────────────
+      - alert: HighInferenceLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(modelmesh_request_latency_seconds_bucket{endpoint="/v1/predict"}[5m])
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 inference latency above 500ms"
+          description: "P95 latency is {{ $value | humanizeDuration }}"
+
+      # ── Drift Alert ──────────────────────────────────────────────────────────
+      - alert: ModelDriftDetected
+        expr: increase(modelmesh_drift_alerts_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data drift detected in model {{ $labels.model_name }}"
+
+      # ── Low Prediction Throughput ────────────────────────────────────────────
+      - alert: LowPredictionThroughput
+        expr: rate(modelmesh_predictions_total[5m]) < 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prediction throughput below 1 req/s for 10 minutes"
+
+      # ── API Down ─────────────────────────────────────────────────────────────
+      - alert: ModelMeshAPIDown
+        expr: up{job="modelmesh-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ModelMesh API is down"

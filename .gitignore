@@ -1,0 +1,58 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.xml
+load_report.html
+locust_*.html
+
+# MLflow
+mlruns/
+test_mlruns.db
+mlartifacts/
+
+# Data (raw data stays local; processed can be committed selectively)
+data/raw/*.csv
+data/processed/*.json
+data/reference/*.parquet
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docker
+*.tar
+
+# Kubernetes secrets
+k8s/overlays/prod/secrets.yaml
+
+# Logs
+*.log
+logs/
+
+# Optuna
+optuna.db

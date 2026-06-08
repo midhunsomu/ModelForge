@@ -1,0 +1,126 @@
+{
+  "title": "ModelMesh — Inference Dashboard",
+  "uid": "modelmesh-inference",
+  "version": 1,
+  "schemaVersion": 36,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["mlops", "modelmesh"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (req/s)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "sum(rate(modelmesh_requests_total[2m]))",
+        "legendFormat": "req/s"
+      }],
+      "options": { "colorMode": "background", "graphMode": "area" }
+    },
+    {
+      "id": 2,
+      "title": "P95 Inference Latency (ms)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum(rate(modelmesh_request_latency_seconds_bucket{endpoint='/v1/predict'}[5m])) by (le)) * 1000",
+        "legendFormat": "P95 ms"
+      }],
+      "options": {
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 200 },
+            { "color": "red", "value": 500 }
+          ]
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Error Rate (%)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{
+        "expr": "sum(rate(modelmesh_requests_total{status_code=~'5..'}[5m])) / sum(rate(modelmesh_requests_total[5m])) * 100",
+        "legendFormat": "error %"
+      }],
+      "options": {
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 1 },
+            { "color": "red", "value": 5 }
+          ]
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Active Requests",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{
+        "expr": "modelmesh_active_requests",
+        "legendFormat": "active"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "Request Latency Distribution",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(modelmesh_request_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(modelmesh_request_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "P95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(modelmesh_request_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Predictions by Label",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(modelmesh_predictions_total{prediction_label='0'}[5m]))",
+          "legendFormat": "No Churn (0)"
+        },
+        {
+          "expr": "sum(rate(modelmesh_predictions_total{prediction_label='1'}[5m]))",
+          "legendFormat": "Churn (1)"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Drift Alerts Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 12 },
+      "targets": [{
+        "expr": "increase(modelmesh_drift_alerts_total[1h])",
+        "legendFormat": "Drift Alerts"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        }
+      }
+    }
+  ]
+}

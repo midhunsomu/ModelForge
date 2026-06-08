@@ -1,0 +1,333 @@
+name: ModelMesh CI/CD Pipeline
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, production]
+      run_training:
+        description: "Trigger model retraining"
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Lint + Format ────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dev deps
+        run: pip install ruff mypy black isort
+
+      - name: Run Ruff linter
+        run: ruff check src/ pipelines/ config/ --output-format=github
+
+      - name: Check Black formatting
+        run: black --check src/ pipelines/ config/
+
+      - name: Check import order
+        run: isort --check-only src/ pipelines/ config/
+
+      - name: Type check (mypy)
+        run: mypy src/api/ src/serving/ config/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true   # non-blocking for now; harden over time
+
+  # ── Unit Tests ────────────────────────────────────────────────────────────────
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements/api.txt
+          pip install -r requirements/training.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --tb=short \
+            -v
+        env:
+          ENVIRONMENT: development
+          MLFLOW_TRACKING_URI: "http://localhost:5000"
+          POSTGRES_HOST: localhost
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ── Integration Tests ────────────────────────────────────────────────────────
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test-unit
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: modelmesh
+          POSTGRES_PASSWORD: modelmesh_secret
+          POSTGRES_DB: modelmesh_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install -r requirements/api.txt
+          pip install -r requirements/training.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ \
+            --tb=short \
+            -v \
+            -x
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: modelmesh
+          POSTGRES_PASSWORD: modelmesh_secret
+          POSTGRES_DB: modelmesh_db
+          ENVIRONMENT: development
+          ENABLE_KAFKA_STREAMING: "false"
+          MLFLOW_TRACKING_URI: "sqlite:///./test_mlruns.db"
+
+  # ── Docker Build ──────────────────────────────────────────────────────────────
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      api_image: ${{ steps.meta-api.outputs.tags }}
+      api_digest: ${{ steps.push-api.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (API)
+        id: meta-api
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/api
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push API image
+        id: push-api
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/api/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-api.outputs.tags }}
+          labels: ${{ steps.meta-api.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build drift monitor image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/drift/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/drift:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Security Scan ─────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.api_image }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"   # fail pipeline on CRITICAL/HIGH vulns
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        if: always()
+
+  # ── Deploy to Staging ────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.modelmesh.internal
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_STAGING }}
+
+      - name: Deploy to staging namespace
+        run: |
+          kubectl set image deployment/modelmesh-api \
+            api=${{ needs.build.outputs.api_image }} \
+            -n modelmesh-staging
+          kubectl rollout status deployment/modelmesh-api \
+            -n modelmesh-staging \
+            --timeout=120s
+
+      - name: Run smoke tests
+        run: |
+          STAGING_URL="https://staging.modelmesh.internal"
+          curl -f "$STAGING_URL/health/live" || exit 1
+          curl -f "$STAGING_URL/health/ready" || exit 1
+          echo "✅ Smoke tests passed"
+
+  # ── Deploy to Production ──────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: |
+      github.ref == 'refs/heads/main' && 
+      github.event_name == 'push'
+    environment:
+      name: production
+      url: https://api.modelmesh.io
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_PROD }}
+
+      - name: Rolling deploy (zero-downtime)
+        run: |
+          kubectl set image deployment/modelmesh-api \
+            api=${{ needs.build.outputs.api_image }} \
+            -n modelmesh
+          kubectl rollout status deployment/modelmesh-api \
+            -n modelmesh \
+            --timeout=180s
+
+      - name: Verify deployment health
+        run: |
+          sleep 15
+          REPLICAS=$(kubectl get deployment modelmesh-api -n modelmesh \
+            -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment modelmesh-api -n modelmesh \
+            -o jsonpath='{.spec.replicas}')
+          if [ "$REPLICAS" != "$DESIRED" ]; then
+            echo "❌ Only $REPLICAS/$DESIRED replicas ready — rolling back"
+            kubectl rollout undo deployment/modelmesh-api -n modelmesh
+            exit 1
+          fi
+          echo "✅ All $REPLICAS replicas healthy"
+
+      - name: Tag release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/deploy-${context.sha.substring(0,7)}`,
+              sha: context.sha
+            })
+
+  # ── Trigger Retrain (manual) ──────────────────────────────────────────────────
+  trigger-retrain:
+    name: Trigger Model Retraining
+    runs-on: ubuntu-latest
+    if: github.event.inputs.run_training == 'true'
+    needs: deploy-production
+
+    steps:
+      - name: Trigger Prefect retrain flow
+        run: |
+          curl -X POST "${{ secrets.PREFECT_API_URL }}/deployments/by_name/modelmesh-retrain/production/create_flow_run" \
+            -H "Authorization: Bearer ${{ secrets.PREFECT_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"parameters": {"triggered_by": "ci_cd_manual"}}'
