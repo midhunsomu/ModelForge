@@ -186,7 +186,7 @@ modelForge/
 
 ### 1. Clone and configure
 ```bash
-git clone https://github.com/your-org/modelmesh.git
+git clone https://github.com/your-org/ModelForge.git
 cd modelForge
 cp .env.example .env
 ```
