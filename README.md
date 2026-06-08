@@ -2,7 +2,6 @@
 
 > **Production-grade** MLOps infrastructure for real-time model serving, automated drift detection, A/B shadow deployment, and self-healing retraining pipelines.
 
-[![CI/CD](https://github.com/your-org/modelmesh/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/your-org/modelmesh/actions)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green)](https://fastapi.tiangolo.com)
 [![MLflow](https://img.shields.io/badge/MLflow-2.9-orange)](https://mlflow.org)
